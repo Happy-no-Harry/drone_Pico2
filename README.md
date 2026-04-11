@@ -1,4 +1,4 @@
-# Pico2 抓取/投递控制系统
+# drone_Pico2 抓取/投递控制系统
 
 ## 项目简介
 本项目基于 Raspberry Pi Pico 2，使用三路红外传感器和两路舵机实现抓取与投递流程控制，并通过一个飞控触发引脚输出升空/起飞脉冲。
@@ -143,7 +143,7 @@ cmake --build build
 - RISC-V Reset (RP2350)
 
 ## 目录说明
-- `Pico2.c`：主程序（状态机、命令解析、红外与舵机控制）
+- `drone_Pico2.c`：主程序（状态机、命令解析、红外与舵机控制）
 - `CMakeLists.txt`：构建配置
 - `pico_sdk_import.cmake`：Pico SDK 导入脚本
 - `build/`：构建输出目录

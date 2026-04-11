@@ -28,32 +28,32 @@ set(PICO_BOARD pico2 CACHE STRING "Board type")
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
 
-project(Pico2 C CXX ASM)
+project(drone_Pico2 C CXX ASM)
 
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(Pico2 Pico2.c )
+add_executable(drone_Pico2 drone_Pico2.c )
 
-pico_set_program_name(Pico2 "Pico2")
-pico_set_program_version(Pico2 "0.1")
+pico_set_program_name(drone_Pico2 "drone_Pico2")
+pico_set_program_version(drone_Pico2 "0.1")
 
 # Modify the below lines to enable/disable output over UART/USB
-pico_enable_stdio_uart(Pico2 0)
-pico_enable_stdio_usb(Pico2 1)
+pico_enable_stdio_uart(drone_Pico2 0)
+pico_enable_stdio_usb(drone_Pico2 1)
 
 # Add the standard library to the build
-target_link_libraries(Pico2
+target_link_libraries(drone_Pico2
         pico_stdlib
         hardware_pwm
         hardware_adc)
 
 # Add the standard include files to the build
-target_include_directories(Pico2 PRIVATE
+target_include_directories(drone_Pico2 PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
 )
 
-pico_add_extra_outputs(Pico2)
+pico_add_extra_outputs(drone_Pico2)
 

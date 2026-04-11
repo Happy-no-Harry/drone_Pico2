@@ -463,7 +463,7 @@ void state_machine_run(void) {
 int main() {
     stdio_init_all();
     sleep_ms(2000);
-    printf("\r\n=== Pico2 Grab/Release System Ready ===\r\n");
+    printf("\r\n=== drone_Pico2 Grab/Release System Ready ===\r\n");
 
     // 初始化飞控触发引脚，默认低电平。
     gpio_init(FLY_TRIGGER_PIN);
