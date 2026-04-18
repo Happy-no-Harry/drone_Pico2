@@ -2,25 +2,31 @@
 #include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/pwm.h"
+#include "hardware/clocks.h"
 
 // ===================== 硬件配置（按实际接线修改）=====================
-#define SERVO1_PIN 2       // S1舵机引脚
-#define SERVO2_PIN 3       // S2舵机引脚
-#define IR1_PIN    26      // 红外1
-#define IR2_PIN    27      // 红外2
-#define IR3_PIN    28      // 红外3
-#define FLY_TRIGGER_PIN 15 // 飞控升空触发引脚
+#define SERVO1_PIN 14       // S1舵机引脚
+#define SERVO2_PIN 15       // S2舵机引脚
+#define IR1_PIN    7      // 红外1
+#define IR2_PIN    8      // 红外2
+#define IR3_PIN    9      // 红外3
+#define FLY_TRIGGER_PIN 16 // 飞控升空触发引脚
+#define LED_D1 2       // LED（暂时没用）
+#define LED_D2 3       // LED（暂时没用）
+#define LED_D3 4       // LED（暂时没用）
+#define LED_D4 5       // LED（暂时没用）
 
 // ===================== 舵机参数配置 =====================
 // 常见舵机使用 50Hz PWM，0~180 度通常映射到 0.5ms~2.5ms 高电平脉宽。
 #define SERVO_PWM_FREQ 50       // 标准50Hz
+#define SERVO_PWM_WRAP 19999    // 20ms 对应 20000 计数（wrap+1）
 #define SERVO_TARGET_ANGLE 90   // 取货时旋转角度
 #define SERVO_RESET_ANGLE  0    // 投递时复位角度
 #define SERVO_DELAY_MS 1000     // 舵机动作等待时间
 #define SERVO_GRAB_GAP_MS 300   // 取货时两舵机动作间隔
 #define SERVO_MIN_CMD_INTERVAL_MS 250   // 同一舵机两次命令最小间隔
 #define SERVO_OVERFREQ_WINDOW_MS 1200   // 过频统计窗口
-#define SERVO_OVERFREQ_LIMIT 3          // 窗口内最大允许动作次数
+#define SERVO_OVERFREQ_LIMIT 5          // 窗口内最大允许动作次数
 #define SERVO_PROTECT_COOLDOWN_MS 2000  // 触发保护后的冷却时间
 
 // ===================== 红外参数配置 =====================
@@ -94,10 +100,12 @@ static absolute_time_t actuate_start = {0};  // 使用 {0} 初始化为nil_time
 // - 角度线性映射到 500us~2500us
 uint16_t angle_to_pwm(uint8_t angle) {
     if (angle > 180) angle = 180;
-    uint32_t wrap = 19999; // 对应1MHz计数, 20ms周期
     // 使用浮点数除法避免整数截断导致角度精度丢失
     float pulse_us = 500.0f + ((float)angle / 180.0f) * 2000.0f;
-    return (uint16_t)((pulse_us / 20000.0f) * wrap);
+    float period_us = 1000000.0f / (float)SERVO_PWM_FREQ;
+    uint32_t level = (uint32_t)((pulse_us / period_us) * (float)(SERVO_PWM_WRAP + 1u));
+    if (level > SERVO_PWM_WRAP) level = SERVO_PWM_WRAP;
+    return (uint16_t)level;
 }
 
 // ===================== 通用的安全驱动内核 =====================
@@ -111,7 +119,7 @@ ServoActionResult servo_safe_set_internal(ServoGuard *guard, uint pin, uint8_t t
     // 1. 懒初始化
     if (!guard->initialized) {
         guard->commanded_angle = SERVO_RESET_ANGLE;
-        guard->last_cmd_time = now;
+        guard->last_cmd_time = nil_time;
         guard->window_start_time = now;
         guard->protect_until = now;
         guard->window_cmd_count = 0;
@@ -120,14 +128,15 @@ ServoActionResult servo_safe_set_internal(ServoGuard *guard, uint pin, uint8_t t
     }
 
     // 2. 冷却期检查
-    // 修正时间比对逻辑 - absolute_time_diff_us(a,b) = a-b
-    // 若now < protect_until，则差值为负，表示仍在冷却期内
-    if (absolute_time_diff_us(guard->protect_until, now) > 0) {
+    // absolute_time_diff_us(from, to) = to - from
+    // 若 now < protect_until，则 (protect_until - now) > 0，表示仍在冷却期内
+    if (absolute_time_diff_us(now, guard->protect_until) > 0) {
         if (!guard->cooldown_notified) {
             printf("[WARN] Servo locked. Cooldown remaining: %lld ms\r\n", 
-                   absolute_time_diff_us(guard->protect_until, now) / 1000);
+                   absolute_time_diff_us(now, guard->protect_until) / 1000);
             guard->cooldown_notified = true;
         }
+        printf("[WARN] Command to pin %d blocked due to cooldown.\r\n", pin);
         return SERVO_ACTION_BLOCKED;
     }
     guard->cooldown_notified = false;
@@ -138,9 +147,13 @@ ServoActionResult servo_safe_set_internal(ServoGuard *guard, uint pin, uint8_t t
     }
 
     // 4. 最小间隔限制 (如果太快，直接拒绝，不做 sleep 阻塞)
-    int64_t dt_us = absolute_time_diff_us(guard->last_cmd_time, now);
-    if (dt_us < (int64_t)SERVO_MIN_CMD_INTERVAL_MS * 1000) {
-        return SERVO_ACTION_BLOCKED;
+    if (!is_nil_time(guard->last_cmd_time)) {
+        int64_t dt_us = absolute_time_diff_us(guard->last_cmd_time, now);
+        if (dt_us < (int64_t)SERVO_MIN_CMD_INTERVAL_MS * 1000) {
+            printf("[WARN] Command to pin %d blocked due to minimum interval. Time since last command: %lld ms\r\n", 
+                   pin, dt_us / 1000);
+            return SERVO_ACTION_BLOCKED;
+        }
     }
 
     // 5. 滑动窗口过频保护
@@ -178,10 +191,20 @@ void servo_init(void) {
     uint slice1 = pwm_gpio_to_slice_num(SERVO1_PIN);
     uint slice2 = pwm_gpio_to_slice_num(SERVO2_PIN);
 
-    pwm_set_clkdiv(slice1, 125.0f); // 125MHz / 125 = 1MHz
-    pwm_set_wrap(slice1, 19999);
-    pwm_set_clkdiv(slice2, 125.0f);
-    pwm_set_wrap(slice2, 19999);
+    // 按当前系统时钟计算分频，避免不同默认时钟(如 125MHz/150MHz)导致频率偏差。
+    uint32_t clk_hz = clock_get_hz(clk_sys);
+    float clkdiv = (float)clk_hz / ((float)(SERVO_PWM_WRAP + 1u) * (float)SERVO_PWM_FREQ);
+    if (clkdiv < 1.0f) clkdiv = 1.0f;
+    if (clkdiv > 255.0f) clkdiv = 255.0f;
+
+    pwm_set_clkdiv(slice1, clkdiv);
+    pwm_set_wrap(slice1, SERVO_PWM_WRAP);
+    pwm_set_clkdiv(slice2, clkdiv);
+    pwm_set_wrap(slice2, SERVO_PWM_WRAP);
+
+    float actual_freq = (float)clk_hz / (clkdiv * (float)(SERVO_PWM_WRAP + 1u));
+    printf("[PWM] clk_sys=%lu Hz, clkdiv=%.3f, wrap=%u, target=%d Hz, actual=%.3f Hz\r\n",
+           (unsigned long)clk_hz, clkdiv, SERVO_PWM_WRAP, SERVO_PWM_FREQ, actual_freq);
 
     pwm_set_gpio_level(SERVO1_PIN, angle_to_pwm(SERVO_RESET_ANGLE));
     pwm_set_gpio_level(SERVO2_PIN, angle_to_pwm(SERVO_RESET_ANGLE));
@@ -261,7 +284,7 @@ void uart_process_command(void) {
                 }
             }
             else if (strcmp(uart_buf, "release") == 0) {
-                if (current_state == STATE_HOLDING) {
+                if (current_state == STATE_HOLDING || current_state == STATE_IDLE) {
                     printf("[CMD] Received: release\r\n");
                     current_state = STATE_RELEASE_ACTUATE;
                 } else {
@@ -301,7 +324,7 @@ void uart_process_command(void) {
 void state_machine_run(void) {
     switch (current_state) {
         case STATE_IDLE:
-            printf("[STATE] IDLE (Send 'grab')\r\n");
+            printf("[STATE] IDLE (Send 'grab' or 'release')\r\n");
             sleep_ms(1000);
             break;
 
