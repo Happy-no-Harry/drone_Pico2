@@ -33,6 +33,11 @@ project(drone_Pico2 C CXX ASM)
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
+# TEST_MODE uses explicit numeric values only:
+# 0 = field mode (UART0 GP12/GP13), 1 = test mode (USB stdio)
+set(TEST_MODE "0" CACHE STRING "0=field(UART0 GP12/GP13), 1=test(USB stdio)")
+set_property(CACHE TEST_MODE PROPERTY STRINGS 0 1)
+
 # Add executable. Default name is the project name, version 0.1
 
 add_executable(drone_Pico2 drone_Pico2.c )
@@ -41,8 +46,22 @@ pico_set_program_name(drone_Pico2 "drone_Pico2")
 pico_set_program_version(drone_Pico2 "0.1")
 
 # Modify the below lines to enable/disable output over UART/USB
-pico_enable_stdio_uart(drone_Pico2 0)
-pico_enable_stdio_usb(drone_Pico2 1)
+if(TEST_MODE STREQUAL "1")
+    pico_enable_stdio_uart(drone_Pico2 0)
+    pico_enable_stdio_usb(drone_Pico2 1)
+else()
+    pico_enable_stdio_uart(drone_Pico2 1)
+    # Keep USB enabled in field mode so picotool "Run Project" can still reboot/flash.
+    pico_enable_stdio_usb(drone_Pico2 1)
+    target_compile_definitions(drone_Pico2 PRIVATE
+            PICO_DEFAULT_UART=0
+            PICO_DEFAULT_UART_TX_PIN=12
+            PICO_DEFAULT_UART_RX_PIN=13
+            PICO_DEFAULT_UART_BAUD_RATE=115200)
+endif()
+
+# Define TEST_MODE macro from numeric cache value directly.
+target_compile_definitions(drone_Pico2 PRIVATE TEST_MODE=${TEST_MODE})
 
 # Add the standard library to the build
 target_link_libraries(drone_Pico2

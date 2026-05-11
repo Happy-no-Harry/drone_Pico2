@@ -1,21 +1,30 @@
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
+#include "hardware/uart.h"
 #include "hardware/pwm.h"
 #include "hardware/clocks.h"
+
+#ifndef TEST_MODE
+#define TEST_MODE 0
+#endif
+
+// Debug print macro: when TEST_MODE is defined (debug mode), enable DBG_PRINT to
+// print verbose logs; in field mode DBG_PRINT is a no-op.
+#if TEST_MODE
+#define DBG_PRINT(...) printf(__VA_ARGS__)
+#else
+#define DBG_PRINT(...) do {} while(0)
+#endif
 
 // ===================== 硬件配置（按实际接线修改）=====================
 #define SERVO1_PIN 14       // S1舵机引脚
 #define SERVO2_PIN 15       // S2舵机引脚
-#define IR1_PIN    7      // 红外1
-#define IR2_PIN    8      // 红外2
-#define IR3_PIN    9      // 红外3
 #define FLY_TRIGGER_PIN 16 // 飞控升空触发引脚
 #define LED_D1 2       // LED（红）
 #define LED_D2 3       // LED（黄）
 #define LED_D3 4       // LED（蓝）
 #define LED_D4 5       // LED（绿）
-#define ONLY_IR3
 
 // ===================== 舵机参数配置 =====================
 // 常见舵机使用 50Hz PWM，0~180 度通常映射到 0.5ms~2.5ms 高电平脉宽。
@@ -23,49 +32,31 @@
 #define SERVO_PWM_WRAP 19999    // 20ms 对应 20000 计数（wrap+1）
 #define SERVO_TARGET_ANGLE 90   // 取货时旋转角度
 #define SERVO_RESET_ANGLE  0    // 投递时复位角度
-#define SERVO_DELAY_MS 1000     // 舵机动作等待时间
-#define SERVO_GRAB_GAP_MS 300   // 取货时两舵机动作间隔
+#define SERVO_DELAY_MS 2000     // 抓取动作等待时间
+#define SERVO_GRAB_GAP_MS 1000   // 取货时两舵机动作间隔
 #define SERVO_MIN_CMD_INTERVAL_MS 250   // 同一舵机两次命令最小间隔
 #define SERVO_OVERFREQ_WINDOW_MS 1200   // 过频统计窗口
 #define SERVO_OVERFREQ_LIMIT 5          // 窗口内最大允许动作次数
 #define SERVO_PROTECT_COOLDOWN_MS 2000  // 触发保护后的冷却时间
 
-// ===================== 红外参数配置 =====================
-// 本项目约定：红外被遮挡时输出低电平。
-#define OBSTACLE_LEVEL  0       // 有障碍物=低电平
-#define CLEAR_LEVEL     1       // 无障碍物=高电平
-#define IR_DEBOUNCE_MS  10      // 防抖时间
-
 // ===================== 状态机定义 =====================
-// 取货与投递按阶段推进，每次只处理一个状态，避免动作互相重叠。
+// 最小命令驱动状态机：收到 grab 就抓取，收到 release 就释放。
 typedef enum {
     STATE_IDLE,                 // 空闲：等待指令
-    STATE_GRAB_CHECK,           // 取货检测：判断红外组合
-    STATE_GRAB_ACTUATE,         // 取货动作：驱动舵机
-    STATE_WAIT_ASCEND,          // 等待ascend指令
-    STATE_GRAB_VERIFY,          // 抓取验证：检查IR3
+    STATE_GRAB,                 // 抓取动作：S1->S2
     STATE_HOLDING,              // 持货等待
-    STATE_RELEASE_ACTUATE,      // 投递动作：S1->S2
-    STATE_WAIT_TAKEOFF,         // 等待takeoff指令
-    STATE_RELEASE_VERIFY,       // 投递验证：检查全部红外
+    STATE_RELEASE,              // 释放动作：S1->S2
     STATE_ERROR
 } SystemState;
 
 // ===================== 全局变量 =====================
-// 串口缓冲只做短命令接收（grab/ascend/release/takeoff）。
+// 串口缓冲只做短命令接收（START_GRAB / START_RELEASE / RESET）。
 static SystemState current_state = STATE_IDLE;
 static char uart_buf[64] = {0};
 static uint8_t buf_idx = 0;
 // 错误恢复计数器 - 避免ERROR状态无限循环
 static uint8_t error_recovery_count = 0;
 static const uint8_t ERROR_RECOVERY_MAX = 1;  // ERROR状态最多执行1次恢复
-
-// ===================== 红外状态结构体 =====================
-typedef struct {
-    bool ir1;
-    bool ir2;
-    bool ir3;
-} IRState;
 
 // ===================== 舵机保护结构体 =====================
 // 无电流传感器条件下的软件防堵转：
@@ -97,10 +88,79 @@ static absolute_time_t state_enter_time = {0};
 static SystemState last_state_observed = (SystemState)-1;
 static bool fly_pulse_active = false;
 static absolute_time_t fly_pulse_until = {0};
+static bool grab_seq_started = false;
+static absolute_time_t grab_seq_gap_start = {0};
+static bool release_seq_started = false;
+static absolute_time_t release_seq_gap_start = {0};
+static bool reset_done = false; // whether RESET command has been received
+
+typedef struct {
+    const char *keyword;
+    SystemState required_state;
+    bool allow_any_state;
+    SystemState next_state;
+    const char *received_msg;
+    const char *rejected_msg;
+} CommandRule;
+
+// forward declarations for servo helpers (used by command dispatch)
+ServoActionResult servo1_set(uint8_t angle);
+ServoActionResult servo2_set(uint8_t angle);
+// forward declaration for feedback helper
+static void send_feedback_repeat(const char *msg, int times, int interval_ms);
+
+static int read_command_char_nonblocking(void) {
+#if TEST_MODE
+    // Test mode: keep command source on USB stdio.
+    return getchar_timeout_us(0);
+#else
+    // Field mode: command input is forced to UART0 only.
+    if (uart_is_readable(uart0)) {
+        return uart_getc(uart0);
+    }
+    return PICO_ERROR_TIMEOUT;
+#endif
+}
+
+static bool uart_try_dispatch_command(void) {
+    static const CommandRule rules[] = {
+        {"START_GRAB",    STATE_IDLE,     false, STATE_GRAB,    "[CMD] Received: START_GRAB\r\n",    "[CMD] Rejected: START_GRAB (invalid state %d)\r\n"},
+        {"START_RELEASE", STATE_IDLE,     true,  STATE_RELEASE, "[CMD] Received: START_RELEASE\r\n", "[CMD] Rejected: START_RELEASE (invalid state %d)\r\n"},
+        {"RESET",         STATE_IDLE,     true,  STATE_IDLE,    "[CMD] Received: RESET\r\n",         "[CMD] Rejected: RESET (invalid state %d)\r\n"},
+    };
+
+    for (uint i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
+            if (strstr(uart_buf, rules[i].keyword) != NULL) {
+            if (current_state == rules[i].required_state ||
+                rules[i].allow_any_state) {
+                DBG_PRINT("%s", rules[i].received_msg);
+                /* 特殊命令：RESET 立即执行安全复位并回送确认 */
+                if (strcmp(rules[i].keyword, "RESET") == 0) {
+                    servo1_set(SERVO_RESET_ANGLE);
+                    servo2_set(SERVO_RESET_ANGLE);
+                    gpio_put(FLY_TRIGGER_PIN, 0);
+                    fly_pulse_active = false;
+                    actuate_start = nil_time;
+                    error_recovery_count = 0;
+                    reset_done = true;
+                    send_feedback_repeat("RESET_DONE\r\n", 3, 50);
+                }
+                current_state = rules[i].next_state;
+            } else {
+                DBG_PRINT(rules[i].rejected_msg, current_state);
+            }
+            buf_idx = 0;
+            memset(uart_buf, 0, sizeof(uart_buf));
+            return true;
+        }
+    }
+
+    return false;
+}
 
 // ===================== LED 灯效系统 =====================
 // 若你的LED是低电平点亮，请改为 1。
-#define LED_ACTIVE_LOW 0
+#define LED_ACTIVE_LOW 1
 #define LED_FX_TICK_MS 50
 
 typedef struct {
@@ -166,35 +226,26 @@ void led_fx_update(void) {
     uint8_t mask = 0;
     switch (current_state) {
         case STATE_IDLE: {
-            // 骑士流光：左右来回扫描
-            const uint8_t seq[] = {0x1, 0x2, 0x4, 0x8, 0x4, 0x2};
-            mask = seq[led_fx.tick % (sizeof(seq) / sizeof(seq[0]))];
+            if (!reset_done) {
+                // 未收到 RESET，常亮红灯
+                mask = 0x1;
+            } else {
+                // 只亮绿、蓝灯，表示系统准备就绪
+                const uint8_t seq[] = {0x8, 0x8, 0x8,0x8,0x8,0xC,0xC,0xC,0xC,0xC};
+                mask = seq[led_fx.tick % (sizeof(seq) / sizeof(seq[0]))];
+            }
             break;
         }
-        case STATE_GRAB_CHECK:
-        case STATE_GRAB_ACTUATE:
-        case STATE_RELEASE_ACTUATE: {
+        case STATE_GRAB:
+        case STATE_RELEASE: {
             // 彗星推进：逐步拉满再熄灭
             const uint8_t seq[] = {0x1, 0x3, 0x7, 0xF, 0xE, 0xC, 0x8, 0x0};
             mask = seq[led_fx.tick % (sizeof(seq) / sizeof(seq[0]))];
             break;
         }
-        case STATE_WAIT_ASCEND:
-        case STATE_WAIT_TAKEOFF: {
-            // 双闪心跳：提醒等待外部命令
-            uint8_t phase = led_fx.tick % 20u;
-            mask = (phase < 2u || (phase >= 5u && phase < 7u)) ? 0xFu : 0x0u;
-            break;
-        }
-        case STATE_GRAB_VERIFY:
-        case STATE_RELEASE_VERIFY: {
-            // 交叉闪烁：验证阶段
-            mask = (led_fx.tick & 1u) ? 0x5u : 0xAu;
-            break;
-        }
         case STATE_HOLDING: {
-            // 持货巡航：常亮 + 细微抖动
-            const uint8_t seq[] = {0xF, 0xF, 0xF, 0xF, 0x7, 0xF, 0xB, 0xF, 0xD, 0xF, 0xE, 0xF};
+            // 持货巡航：骑士流光：左右来回扫描
+            const uint8_t seq[] = {0x1, 0x2, 0x4, 0x8, 0x4, 0x2};
             mask = seq[led_fx.tick % (sizeof(seq) / sizeof(seq[0]))];
             break;
         }
@@ -279,11 +330,11 @@ ServoActionResult servo_safe_set_internal(ServoGuard *guard, uint pin, uint8_t t
     // 若 now < protect_until，则 (protect_until - now) > 0，表示仍在冷却期内
     if (absolute_time_diff_us(now, guard->protect_until) > 0) {
         if (!guard->cooldown_notified) {
-            printf("[WARN] Servo locked. Cooldown remaining: %lld ms\r\n", 
+            DBG_PRINT("[WARN] Servo locked. Cooldown remaining: %lld ms\r\n", 
                    absolute_time_diff_us(now, guard->protect_until) / 1000);
             guard->cooldown_notified = true;
         }
-        printf("[WARN] Command to pin %d blocked due to cooldown.\r\n", pin);
+        DBG_PRINT("[WARN] Command to pin %d blocked due to cooldown.\r\n", pin);
         return SERVO_ACTION_BLOCKED;
     }
     guard->cooldown_notified = false;
@@ -297,7 +348,7 @@ ServoActionResult servo_safe_set_internal(ServoGuard *guard, uint pin, uint8_t t
     if (!is_nil_time(guard->last_cmd_time)) {
         int64_t dt_us = absolute_time_diff_us(guard->last_cmd_time, now);
         if (dt_us < (int64_t)SERVO_MIN_CMD_INTERVAL_MS * 1000) {
-            printf("[WARN] Command to pin %d blocked due to minimum interval. Time since last command: %lld ms\r\n", 
+            DBG_PRINT("[WARN] Command to pin %d blocked due to minimum interval. Time since last command: %lld ms\r\n", 
                    pin, dt_us / 1000);
             return SERVO_ACTION_BLOCKED;
         }
@@ -313,7 +364,7 @@ ServoActionResult servo_safe_set_internal(ServoGuard *guard, uint pin, uint8_t t
     guard->window_cmd_count++;
     if (guard->window_cmd_count > SERVO_OVERFREQ_LIMIT) {
         guard->protect_until = delayed_by_ms(now, SERVO_PROTECT_COOLDOWN_MS);
-        printf("[ERROR] Servo overheated! Locking for %d ms.\r\n", SERVO_PROTECT_COOLDOWN_MS);
+        DBG_PRINT("[ERROR] Servo overheated! Locking for %d ms.\r\n", SERVO_PROTECT_COOLDOWN_MS);
         return SERVO_ACTION_BLOCKED;
     }
 
@@ -324,7 +375,7 @@ ServoActionResult servo_safe_set_internal(ServoGuard *guard, uint pin, uint8_t t
     guard->commanded_angle = target_angle;
     guard->last_cmd_time = now;
     
-    printf("[SERVO] Set to %d deg\r\n", target_angle);
+    DBG_PRINT("[SERVO pin %d] Set to %d deg\r\n", pin, target_angle);
     // 移除阻塞sleep - servo_safe_set_internal应该是非阻塞的
     // 舵机的实际运行延迟由调用端(状态机)处理
     return SERVO_ACTION_DONE;
@@ -350,8 +401,8 @@ void servo_init(void) {
     pwm_set_wrap(slice2, SERVO_PWM_WRAP);
 
     float actual_freq = (float)clk_hz / (clkdiv * (float)(SERVO_PWM_WRAP + 1u));
-    printf("[PWM] clk_sys=%lu Hz, clkdiv=%.3f, wrap=%u, target=%d Hz, actual=%.3f Hz\r\n",
-           (unsigned long)clk_hz, clkdiv, SERVO_PWM_WRAP, SERVO_PWM_FREQ, actual_freq);
+        DBG_PRINT("[PWM] clk_sys=%lu Hz, clkdiv=%.3f, wrap=%u, target=%d Hz, actual=%.3f Hz\r\n",
+            (unsigned long)clk_hz, clkdiv, SERVO_PWM_WRAP, SERVO_PWM_FREQ, actual_freq);
 
     pwm_set_gpio_level(SERVO1_PIN, angle_to_pwm(SERVO_RESET_ANGLE));
     pwm_set_gpio_level(SERVO2_PIN, angle_to_pwm(SERVO_RESET_ANGLE));
@@ -368,195 +419,87 @@ ServoActionResult servo2_set(uint8_t angle) {
     return servo_safe_set_internal(&servo2_guard, SERVO2_PIN, angle);
 }
 
-// ===================== 红外检测函数 =====================
-// 红外输入上拉，配合“遮挡=低电平”的接线方式。
-void ir_gpio_init(void) {
-    #ifdef ONLY_IR3
-    gpio_init(IR3_PIN); gpio_set_dir(IR3_PIN, GPIO_IN); gpio_pull_up(IR3_PIN);
-    #else
-    gpio_init(IR1_PIN); gpio_set_dir(IR1_PIN, GPIO_IN); gpio_pull_up(IR1_PIN);
-    gpio_init(IR2_PIN); gpio_set_dir(IR2_PIN, GPIO_IN); gpio_pull_up(IR2_PIN);
-    gpio_init(IR3_PIN); gpio_set_dir(IR3_PIN, GPIO_IN); gpio_pull_up(IR3_PIN);
-    #endif
-}
-
-// 防抖读取：20ms 内采样 10 次，超过半数判定为“有障碍”。
-// 优化防抖逻辑 - 使用更快的采样间隔减少总延迟
-bool gpio_read_debounce(uint pin) {
-    uint count = 0;
-    for (int i = 0; i < 10; i++) {
-        if (gpio_get(pin) == OBSTACLE_LEVEL) count++;
-        sleep_us(100*IR_DEBOUNCE_MS);  // 改为 1000us，总防抖时间从 20ms 降为 10ms
-    }
-    return count > 5;
-}
-
-// 读取所有红外状态并打印调试信息。
-// 日志中 X 表示被遮挡，O 表示未遮挡。
-IRState ir_read_all(void) {
-    IRState s;
-    #ifdef ONLY_IR3
-    s.ir1 = false;
-    s.ir2 = false;
-    s.ir3 = gpio_read_debounce(IR3_PIN);
-    printf("[IR] IR3:%s\r\n", s.ir3 ? "X" : "O");
-    #else
-    s.ir1 = gpio_read_debounce(IR1_PIN);
-    s.ir2 = gpio_read_debounce(IR2_PIN);
-    s.ir3 = gpio_read_debounce(IR3_PIN);
-    printf("[IR] IR1:%s IR2:%s IR3:%s\r\n", 
-           s.ir1 ? "X" : "O", s.ir2 ? "X" : "O", s.ir3 ? "X" : "O");
-    #endif  
-    return s;
-}
-
 // ===================== 串口指令解析 =====================
-// 采用非阻塞读取：仅在“状态匹配”时接受对应命令，避免误触发流程。
+// 采用非阻塞读取：缓冲区里一旦出现关键字就立即触发，不再依赖换行符。
 void uart_process_command(void) {
-    int c = getchar_timeout_us(0);
+    int c = read_command_char_nonblocking();
     while (c != PICO_ERROR_TIMEOUT) {
         if (c == '\n' || c == '\r') {
             uart_buf[buf_idx] = '\0';
             buf_idx = 0;
-
-            // 指令匹配：同一命令在错误状态下会被忽略。
-            // 添加命令拒绝反馈，避免无声失败
-            if (strcmp(uart_buf, "grab") == 0) {
-                if (current_state == STATE_IDLE) {
-                    printf("[CMD] Received: grab\r\n");
-                    current_state = STATE_GRAB_CHECK;
-                } else {
-                    printf("[CMD] Rejected: grab (invalid state %d)\r\n", current_state);
-                }
-            } 
-            else if (strcmp(uart_buf, "ascend") == 0) {
-                if (current_state == STATE_WAIT_ASCEND) {
-                    printf("[CMD] Received: ascend\r\n");
-                    current_state = STATE_GRAB_VERIFY;
-                } else {
-                    printf("[CMD] Rejected: ascend (invalid state %d)\r\n", current_state);
-                }
-            }
-            else if (strcmp(uart_buf, "release") == 0) {
-                if (current_state == STATE_HOLDING || current_state == STATE_IDLE) {
-                    printf("[CMD] Received: release\r\n");
-                    current_state = STATE_RELEASE_ACTUATE;
-                } else {
-                    printf("[CMD] Rejected: release (invalid state %d)\r\n", current_state);
-                }
-            }
-            else if (strcmp(uart_buf, "takeoff") == 0) {
-                if (current_state == STATE_WAIT_TAKEOFF) {
-                    printf("[CMD] Received: takeoff\r\n");
-                    current_state = STATE_RELEASE_VERIFY;
-                } else {
-                    printf("[CMD] Rejected: takeoff (invalid state %d)\r\n", current_state);
-                }
-            }
-            
             memset(uart_buf, 0, sizeof(uart_buf));
         } else if (buf_idx < sizeof(uart_buf)-1) {
             uart_buf[buf_idx++] = c;
-        }else {
+            uart_buf[buf_idx] = '\0';
+
+            if (uart_try_dispatch_command()) {
+                c = read_command_char_nonblocking();
+                continue;
+            }
+        } else {
             // 溢出保护
-            printf("[WARN] UART buffer overflow\r\n");
+                DBG_PRINT("[WARN] UART buffer overflow\r\n");
             buf_idx = 0;
             memset(uart_buf, 0, sizeof(uart_buf));
         }
-        c = getchar_timeout_us(0);
+        c = read_command_char_nonblocking();
     }
 }
 
 // ===================== 主状态机 =====================
 // 规则摘要：
-// 1) 取货检测时，IR 至少有两个触发且不能是“仅 IR1+IR2”。
-// 2) 取货后必须收到 ascend，再用 IR3 校验是否抓稳。
-// 3) 投递后必须收到 takeoff，再确认三路红外全部清空。
+// 1) IDLE 收到 grab 直接执行抓取动作；
+// 2) HOLDING 收到 release 直接执行释放动作；
+// 3) 无红外检测与中间确认状态。
 void state_machine_run(void) {
     bool entered = false;
     if (current_state != last_state_observed) {
         last_state_observed = current_state;
         state_enter_time = get_absolute_time();
         entered = true;
+
+        if (current_state != STATE_GRAB) {
+            grab_seq_started = false;
+            grab_seq_gap_start = nil_time;
+        }
+        if (current_state != STATE_RELEASE) {
+            release_seq_started = false;
+            release_seq_gap_start = nil_time;
+        }
     }
 
     switch (current_state) {
         case STATE_IDLE:
             if (entered) {
-                printf("[STATE] IDLE (Send 'grab' or 'release')\r\n");
+                DBG_PRINT("[STATE] IDLE (Send 'grab')\r\n");
             }
             break;
 
-        // --- 取货流程 ---
-        case STATE_GRAB_CHECK: {
-            printf("[STATE] Checking IR pattern...\r\n");
-            #ifdef ONLY_IR3
-            printf("[ACT] Drive S1 90deg, then S2 90deg\r\n");
-            ServoActionResult res1 = servo1_set(SERVO_TARGET_ANGLE);
-            if (res1 == SERVO_ACTION_BLOCKED) {
-                printf("[WARN] S1 blocked, will retry\r\n");
-                break;  // 保持当前状态，下次循环重试
+        case STATE_GRAB: {
+            if (!grab_seq_started) {
+                DBG_PRINT("[ACT] Drive S1 90deg, then S2 90deg\r\n");
+                ServoActionResult res1 = servo1_set(SERVO_TARGET_ANGLE+15);
+                if (res1 == SERVO_ACTION_BLOCKED) {
+                    DBG_PRINT("[WARN] S1 blocked, will retry\r\n");
+                    break;
+                }
+                grab_seq_started = true;
+                grab_seq_gap_start = get_absolute_time();
+                break;
             }
-            sleep_ms(SERVO_GRAB_GAP_MS);
+
+            if (absolute_time_diff_us(grab_seq_gap_start, get_absolute_time())
+                < (int64_t)SERVO_GRAB_GAP_MS * 1000) {
+                break;
+            }
+
             ServoActionResult res2 = servo2_set(SERVO_TARGET_ANGLE);
             if (res2 == SERVO_ACTION_BLOCKED) {
-                printf("[WARN] S2 blocked, will retry\r\n");
-                break;  // 保持当前状态，下次循环重试
+                DBG_PRINT("[WARN] S2 blocked, will retry\r\n");
+                break;
             }
-            current_state = STATE_GRAB_ACTUATE;
-            #else
-            IRState ir = ir_read_all();
-            int cnt = ir.ir1 + ir.ir2 + ir.ir3;
-
-            // 错误情况：
-            // - 没有触发
-            // - 仅一个触发
-            // - 仅 IR1+IR2（业务上视为无效姿态）
-            if (cnt == 0 || cnt == 1 || (ir.ir1 && ir.ir2 && !ir.ir3)) {
-                printf("[ERROR] Invalid IR pattern. Task failed.\r\n");
-                current_state = STATE_ERROR;
-            }
-            // 有效情况 A：IR1+IR3 或三路全触发。
-            // 先 S1 后 S2，全部完成后再进入下一阶段。
-            else if ((ir.ir1 && ir.ir3 && !ir.ir2) || (ir.ir1 && ir.ir2 && ir.ir3)) {
-                printf("[ACT] Drive S1 90deg, then S2 90deg\r\n");
-                // 改进舵机失败处理 - BLOCKED可能是暂时阻塞，不应直接ERROR
-                ServoActionResult res1 = servo1_set(SERVO_TARGET_ANGLE);
-                if (res1 == SERVO_ACTION_BLOCKED) {
-                    printf("[WARN] S1 blocked, will retry\r\n");
-                    break;  // 保持当前状态，下次循环重试
-                }
-                sleep_ms(SERVO_GRAB_GAP_MS);
-                ServoActionResult res2 = servo2_set(SERVO_TARGET_ANGLE);
-                if (res2 == SERVO_ACTION_BLOCKED) {
-                    printf("[WARN] S2 blocked, will retry\r\n");
-                    break;  // 保持当前状态，下次循环重试
-                }
-                current_state = STATE_GRAB_ACTUATE;
-            }
-            // 有效情况 B：IR2+IR3。
-            // 先 S2 后 S1，全部完成后再进入下一阶段。
-            else if (ir.ir2 && ir.ir3 && !ir.ir1) {
-                printf("[ACT] Drive S2 90deg, then S1 90deg\r\n");
-                // 改进舵机失败处理 - BLOCKED可能是暂时阻塞，不应直接ERROR
-                ServoActionResult res2 = servo2_set(SERVO_TARGET_ANGLE);
-                if (res2 == SERVO_ACTION_BLOCKED) {
-                    printf("[WARN] S2 blocked, will retry\r\n");
-                    break;  // 保持当前状态，下次循环重试
-                }
-                sleep_ms(SERVO_GRAB_GAP_MS);
-                ServoActionResult res1 = servo1_set(SERVO_TARGET_ANGLE);
-                if (res1 == SERVO_ACTION_BLOCKED) {
-                    printf("[WARN] S1 blocked, will retry\r\n");
-                    break;  // 保持当前状态，下次循环重试
-                }
-                current_state = STATE_GRAB_ACTUATE;
-            }
-            #endif
-            break;
-        }
-
-        case STATE_GRAB_ACTUATE: 
+            grab_seq_started = false;
+            grab_seq_gap_start = nil_time;
             if (is_nil_time(actuate_start)) {
                 actuate_start = get_absolute_time();
             }
@@ -564,30 +507,12 @@ void state_machine_run(void) {
             if (absolute_time_diff_us(actuate_start, get_absolute_time()) 
                 > SERVO_DELAY_MS * 1000) {
                 // 舵机动作完成后给上位机反馈，再等待升空指令。
-                printf("[FEEDBACK] grab_finished\r\n");
+                DBG_PRINT("[FEEDBACK] grab_finished\r\n");
+                send_feedback_repeat("GRAB_DONE\r\n", 3, 50);
                 // grab 动作结束后立即通知飞控，避免把升空信号延后到命令阶段。
                 fly_trigger_pulse_start(1000);
                 actuate_start = nil_time;
-                current_state = STATE_WAIT_ASCEND;
-            }
-            break;
-
-        case STATE_WAIT_ASCEND:
-            if (entered) {
-                printf("[STATE] Waiting for 'ascend'...\r\n");
-            }
-            break;
-
-        case STATE_GRAB_VERIFY: {
-            printf("[STATE] Verifying grab (IR3)...\r\n");
-            IRState ir = ir_read_all();
-            // 约定 IR3 为抓取成功关键位。
-            if (ir.ir3) {
-                printf("[FEEDBACK] grab_success\r\n");
                 current_state = STATE_HOLDING;
-            } else {
-                printf("[FEEDBACK] grab_failed\r\n");
-                current_state = STATE_ERROR;
             }
             break;
         }
@@ -595,55 +520,49 @@ void state_machine_run(void) {
         case STATE_HOLDING:
             // 持货等待阶段，不主动动作，仅等待 release 命令。
             if (entered) {
-                printf("[STATE] Holding (Send 'release')\r\n");
+                DBG_PRINT("[STATE] Holding (Send 'release')\r\n");
             }
             break;
 
-        // --- 投递流程 ---
-        case STATE_RELEASE_ACTUATE:
-            printf("[ACT] Release sequence: S1 then S2\r\n");
-            // 按既定机械顺序先 S1 后 S2，避免机构干涉。
-            // 改进舵机失败处理 - BLOCKED可能是暂时阻塞，不应直接ERROR
-            ServoActionResult s1_res = servo1_set(SERVO_RESET_ANGLE);
-            if (s1_res == SERVO_ACTION_BLOCKED) {
-                printf("[WARN] S1 reset blocked, will retry\r\n");
-                break;  // 重试
+        case STATE_RELEASE: {
+            if (!release_seq_started) {
+                DBG_PRINT("[ACT] Release sequence: S1 then S2\r\n");
+                // 按既定机械顺序先 S1 后 S2，避免机构干涉。
+                ServoActionResult s1_res = servo1_set(SERVO_RESET_ANGLE);
+                if (s1_res == SERVO_ACTION_BLOCKED) {
+                    DBG_PRINT("[WARN] S1 reset blocked, will retry\r\n");
+                    break;
+                }
+                release_seq_started = true;
+                release_seq_gap_start = get_absolute_time();
+                break;
             }
+
+            if (absolute_time_diff_us(release_seq_gap_start, get_absolute_time())
+                < (int64_t)SERVO_GRAB_GAP_MS * 1000) {
+                break;
+            }
+
             ServoActionResult s2_res = servo2_set(SERVO_RESET_ANGLE);
             if (s2_res == SERVO_ACTION_BLOCKED) {
-                printf("[WARN] S2 reset blocked, will retry\r\n");
-                break;  // 重试
+                DBG_PRINT("[WARN] S2 reset blocked, will retry\r\n");
+                break;
             }
-            printf("[FEEDBACK] release_finished\r\n");
-            // release 动作结束后立即通知飞控。
-            fly_trigger_pulse_start(1000);
-            current_state = STATE_WAIT_TAKEOFF;
-            break;
 
-        case STATE_WAIT_TAKEOFF:
-            if (entered) {
-                printf("[STATE] Waiting for 'takeoff'...\r\n");
+            release_seq_started = false;
+            release_seq_gap_start = nil_time;
+            if (is_nil_time(actuate_start)) {
+                actuate_start = get_absolute_time();
             }
-            break;
 
-        case STATE_RELEASE_VERIFY: {
-            printf("[STATE] Verifying release (All IR)...\r\n");
-            IRState ir = ir_read_all();
-            #ifdef ONLY_IR3
-            if (!ir.ir3) {
-                printf("[FEEDBACK] release_success\r\n");
+            if (absolute_time_diff_us(actuate_start, get_absolute_time())
+                > SERVO_DELAY_MS * 1000) {
+                DBG_PRINT("[FEEDBACK] release_finished\r\n");
+                send_feedback_repeat("RELEASE_DONE\r\n", 3, 50);
+                // release 动作结束后立即通知飞控。
+                fly_trigger_pulse_start(1000);
+                actuate_start = nil_time;
                 current_state = STATE_IDLE;
-            }
-            #else 
-            // 投递成功要求三路都未触发
-            if (!ir.ir1 && !ir.ir2 && !ir.ir3) {
-                printf("[FEEDBACK] release_success\r\n");
-                current_state = STATE_IDLE;
-            }
-            #endif 
-            else {
-                printf("[FEEDBACK] release_failed\r\n");
-                current_state = STATE_ERROR;
             }
             break;
         }
@@ -651,16 +570,17 @@ void state_machine_run(void) {
         case STATE_ERROR:
             // 错误恢复：执行安全复位并回到空闲态。
             if (entered) {
-                printf("[STATE] ERROR. Resetting to IDLE...\r\n");
+                DBG_PRINT("[STATE] ERROR. Resetting to IDLE...\r\n");
                 servo1_set(SERVO_RESET_ANGLE);
                 servo2_set(SERVO_RESET_ANGLE);
                 gpio_put(FLY_TRIGGER_PIN, 0);
                 fly_pulse_active = false;
+                actuate_start = nil_time;
                 error_recovery_count++;
             }
 
             if (error_recovery_count >= ERROR_RECOVERY_MAX && state_elapsed_ms() >= 2000) {
-                printf("[STATE] ERROR recovery complete. Back to IDLE.\r\n");
+                DBG_PRINT("[STATE] ERROR recovery complete. Back to IDLE.\r\n");
                 error_recovery_count = 0;
                 current_state = STATE_IDLE;
             }
@@ -677,7 +597,12 @@ void state_machine_run(void) {
 int main() {
     stdio_init_all();
     sleep_ms(2000);
-    printf("\r\n=== drone_Pico2 Grab/Release System Ready ===\r\n");
+    #if TEST_MODE
+    DBG_PRINT("[MODE] TEST_MODE: USB stdio\r\n");
+    #else
+    DBG_PRINT("[MODE] FIELD_MODE: UART0 on GP12/GP13\r\n");
+    #endif
+    DBG_PRINT("\r\n=== drone_Pico2 Grab/Release System Ready ===\r\n");
 
     // 初始化飞控触发引脚，默认低电平。
     gpio_init(FLY_TRIGGER_PIN);
@@ -685,9 +610,8 @@ int main() {
     gpio_put(FLY_TRIGGER_PIN, 0);
 
     servo_init();
-    ir_gpio_init();
     led_fx_init();
-    printf("Init done.\r\n");
+    DBG_PRINT("Init done.\r\n");
 
     while (1) {
         uart_process_command();
@@ -695,5 +619,15 @@ int main() {
         state_machine_run();
         led_fx_update();
         sleep_ms(20);
+    }
+}
+
+// 将反馈信息重复发送若干次，增加上位机/串口丢包容错。
+static void send_feedback_repeat(const char *msg, int times, int interval_ms) {
+    if (times <= 0) return;
+    for (int i = 0; i < times; ++i) {
+        printf("%s", msg);
+        // 让传输有短暂时间窗口，USB CDC/串口驱动会在此期间发送数据
+        sleep_ms(interval_ms);
     }
 }

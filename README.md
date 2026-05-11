@@ -142,6 +142,40 @@ cmake --build build
 - Rescue Reset
 - RISC-V Reset (RP2350)
 
+### 切换 TEST_MODE（0 / 1）
+
+本工程的 `TEST_MODE` 为数值型配置（`0` 或 `1`）：
+
+- `TEST_MODE=1`：测试模式，使用 USB CDC（USB stdio）作为调试与命令通道。
+- `TEST_MODE=0`：现场模式，命令输入强制走 UART0（GP12/GP13），但 USB 仍保留用于刷写/下载（picotool/UF2）。
+
+建议的切换步骤（命令行）：
+
+1. 在项目根目录重新配置并指定模式：
+
+```powershell
+cmake -S . -B build -G Ninja -DTEST_MODE=1   # 或 -DTEST_MODE=0
+cmake --build build
+```
+
+2. 刷写到设备：
+
+- 使用 `Run Project`（picotool）命令：
+```powershell
+C:\Users\<you>/.pico-sdk/picotool/.../picotool.exe load build/drone_Pico2.elf -fx
+```
+- 或手动生成并复制 UF2：
+```powershell
+# build/drone_Pico2.uf2 在 build 目录生成后，按住板子 BOOTSEL 上电，拷入该 uf2
+```
+
+注意事项：
+
+- 修改 `TEST_MODE` 后必须重新运行 CMake 并编译，改动才会生效。
+- 若希望通过 CMake GUI 修改，在 GUI 中把 `TEST_MODE` 设为 `0` 或 `1`（字符串/下拉均可），然后重新生成并编译。
+- 当你选择 `TEST_MODE=0`（现场模式）时，命令接收端将默认使用 UART0（GP12/GP13），请确保外部串口连接与波特率（115200）正确。
+
+
 ## 目录说明
 - `drone_Pico2.c`：主程序（状态机、命令解析、红外与舵机控制）
 - `CMakeLists.txt`：构建配置
