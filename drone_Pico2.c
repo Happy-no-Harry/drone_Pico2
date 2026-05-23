@@ -22,13 +22,25 @@
 #define SERVO2_PIN 15       // S2舵机引脚
 #define FLY_TRIGGER_PIN 16 // 飞控升空触发引脚
 #define LED_D1 2       // LED（红）
+#define GRAB_IR_PIN 7      // 抓取红外触发输入（低电平触发）
 #define LED_D2 3       // LED（黄）
 #define LED_D3 4       // LED（蓝）
 #define LED_D4 5       // LED（绿）
 
+
+#define IR_DEBOUNCE_MS 40  // 红外输入消抖时间
 // ===================== 舵机参数配置 =====================
 // 常见舵机使用 50Hz PWM，0~180 度通常映射到 0.5ms~2.5ms 高电平脉宽。
 #define SERVO_PWM_FREQ 50       // 标准50Hz
+
+typedef struct {
+    bool initialized;
+    bool last_raw_low;
+    bool debounced_low;
+    absolute_time_t last_change_time;
+} DebounceInput;
+
+static DebounceInput grab_ir_debounce = {0};
 #define SERVO_PWM_WRAP 19999    // 20ms 对应 20000 计数（wrap+1）
 #define SERVO_TARGET_ANGLE 90   // 取货时旋转角度
 #define SERVO_RESET_ANGLE  0    // 投递时复位角度
@@ -58,6 +70,8 @@ static uint8_t buf_idx = 0;
 // 错误恢复计数器 - 避免ERROR状态无限循环
 static uint8_t error_recovery_count = 0;
 static const uint8_t ERROR_RECOVERY_MAX = 1;  // ERROR状态最多执行1次恢复
+int DBG1 = 0;
+int DBG2 = 0;
 
 // ===================== 舵机保护结构体 =====================
 // 无电流传感器条件下的软件防堵转：
@@ -91,6 +105,8 @@ static bool fly_pulse_active = false;
 static absolute_time_t fly_pulse_until = {0};
 static bool grab_seq_started = false;
 static absolute_time_t grab_seq_gap_start = {0};
+static bool grab_ir_wait_started = false;
+static absolute_time_t grab_ir_trigger_time = {0};
 static bool release_seq_started = false;
 static absolute_time_t release_seq_gap_start = {0};
 static bool reset_seq_started = false;
@@ -276,6 +292,34 @@ static inline int64_t state_elapsed_ms(void) {
     return absolute_time_diff_us(state_enter_time, get_absolute_time()) / 1000;
 }
 
+static bool grab_ir_is_triggered(void) {
+    absolute_time_t now = get_absolute_time();
+    bool raw_low = (gpio_get(GRAB_IR_PIN) == 0);
+
+    if (!grab_ir_debounce.initialized) {
+        grab_ir_debounce.initialized = true;
+        grab_ir_debounce.last_raw_low = raw_low;
+        // 首次采样不直接判定为稳定态，确保至少经历一次消抖窗口。
+        grab_ir_debounce.debounced_low = false;
+        grab_ir_debounce.last_change_time = now;
+        return false;
+    }
+
+    if (raw_low != grab_ir_debounce.last_raw_low) {
+        grab_ir_debounce.last_raw_low = raw_low;
+        grab_ir_debounce.last_change_time = now;
+    }
+
+    if (raw_low != grab_ir_debounce.debounced_low) {
+        if (absolute_time_diff_us(grab_ir_debounce.last_change_time, now)
+            >= (int64_t)IR_DEBOUNCE_MS * 1000) {
+            grab_ir_debounce.debounced_low = raw_low;
+        }
+    }
+
+    return grab_ir_debounce.debounced_low;
+}
+
 void fly_trigger_pulse_start(uint32_t pulse_ms) {
     gpio_put(FLY_TRIGGER_PIN, 1);
     fly_pulse_active = true;
@@ -381,9 +425,6 @@ ServoActionResult servo_safe_set_internal(ServoGuard *guard, uint pin, uint8_t t
 
 // 舵机初始化：两路舵机统一配置为 50Hz，并默认回到复位角。
 void servo_init(void) {
-    gpio_set_function(SERVO1_PIN, GPIO_FUNC_PWM);
-    gpio_set_function(SERVO2_PIN, GPIO_FUNC_PWM);
-
     uint slice1 = pwm_gpio_to_slice_num(SERVO1_PIN);
     uint slice2 = pwm_gpio_to_slice_num(SERVO2_PIN);
 
@@ -402,7 +443,11 @@ void servo_init(void) {
         DBG_PRINT("[PWM] clk_sys=%lu Hz, clkdiv=%.3f, wrap=%u, target=%d Hz, actual=%.3f Hz\r\n",
             (unsigned long)clk_hz, clkdiv, SERVO_PWM_WRAP, SERVO_PWM_FREQ, actual_freq);
 
+    // 上电先让 S1 单独进入复位，再延时后接上 S2，避免两路同时动作。
+    gpio_set_function(SERVO1_PIN, GPIO_FUNC_PWM);
     pwm_set_gpio_level(SERVO1_PIN, angle_to_pwm(SERVO_RESET_ANGLE));
+
+    gpio_set_function(SERVO2_PIN, GPIO_FUNC_PWM);
     pwm_set_gpio_level(SERVO2_PIN, angle_to_pwm(SERVO_RESET_ANGLE));
     pwm_set_enabled(slice1, true);
     pwm_set_enabled(slice2, true);
@@ -446,9 +491,9 @@ void uart_process_command(void) {
 
 // ===================== 主状态机 =====================
 // 规则摘要：
-// 1) IDLE 收到 grab 直接执行抓取动作；
+// 1) IDLE 收到 grab 后，等待 GPIO7 红外低电平触发再执行抓取；
 // 2) HOLDING 收到 release 直接执行释放动作；
-// 3) 无红外检测与中间确认状态。
+// 3) 抓取触发输入带消抖处理。
 void state_machine_run(void) {
     bool entered = false;
     if (current_state != last_state_observed) {
@@ -459,6 +504,8 @@ void state_machine_run(void) {
         if (current_state != STATE_GRAB) {
             grab_seq_started = false;
             grab_seq_gap_start = nil_time;
+            grab_ir_wait_started = false;
+            grab_ir_trigger_time = nil_time;
         }
         if (current_state != STATE_RELEASE) {
             release_seq_started = false;
@@ -479,7 +526,28 @@ void state_machine_run(void) {
 
         case STATE_GRAB: {
             if (!grab_seq_started) {
-                DBG_PRINT("[ACT] Drive S1 90deg, then S2 90deg\r\n");
+                if (!grab_ir_is_triggered()) {
+                    if (entered) {
+                        DBG_PRINT("[WAIT] START_GRAB received, waiting IR(GPIO7) low trigger...\r\n");
+                    }
+                    grab_ir_wait_started = false;
+                    grab_ir_trigger_time = nil_time;
+                    break;
+                }
+
+                if (!grab_ir_wait_started) {
+                    grab_ir_wait_started = true;
+                    grab_ir_trigger_time = get_absolute_time();
+                    DBG_PRINT("[WAIT] IR triggered, delaying 5 seconds before grab...\r\n");
+                    break;
+                }
+
+                if (absolute_time_diff_us(grab_ir_trigger_time, get_absolute_time())
+                    < 5000 * 1000) {
+                    break;
+                }
+
+                DBG_PRINT("[ACT] 5-second delay elapsed, drive S1 90deg, then S2 90deg\r\n");
                 ServoActionResult res1 = servo1_set(SERVO_TARGET_ANGLE+15);
                 if (res1 == SERVO_ACTION_BLOCKED) {
                     DBG_PRINT("[WARN] S1 blocked, will retry\r\n");
@@ -515,6 +583,8 @@ void state_machine_run(void) {
                 current_state = STATE_HOLDING;
                 grab_seq_started = false;
                 grab_seq_gap_start = nil_time;
+                grab_ir_wait_started = false;
+                grab_ir_trigger_time = nil_time;
             }
             break;
         }
@@ -658,6 +728,11 @@ int main() {
     gpio_init(FLY_TRIGGER_PIN);
     gpio_set_dir(FLY_TRIGGER_PIN, GPIO_OUT);
     gpio_put(FLY_TRIGGER_PIN, 0);
+
+    // 初始化抓取红外输入：GPIO7，低电平触发，开启上拉防止悬空。
+    gpio_init(GRAB_IR_PIN);
+    gpio_set_dir(GRAB_IR_PIN, GPIO_IN);
+    gpio_pull_up(GRAB_IR_PIN);
 
     servo_init();
     led_fx_init();
