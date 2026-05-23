@@ -46,6 +46,7 @@ typedef enum {
     STATE_GRAB,                 // 抓取动作：S1->S2
     STATE_HOLDING,              // 持货等待
     STATE_RELEASE,              // 释放动作：S1->S2
+    STATE_RESET,                // 安全复位动作：S1->S2
     STATE_ERROR
 } SystemState;
 
@@ -92,6 +93,8 @@ static bool grab_seq_started = false;
 static absolute_time_t grab_seq_gap_start = {0};
 static bool release_seq_started = false;
 static absolute_time_t release_seq_gap_start = {0};
+static bool reset_seq_started = false;
+static absolute_time_t reset_seq_gap_start = {0};
 static bool reset_done = false; // whether RESET command has been received
 
 typedef struct {
@@ -126,7 +129,7 @@ static bool uart_try_dispatch_command(void) {
     static const CommandRule rules[] = {
         {"START_GRAB",    STATE_IDLE,     false, STATE_GRAB,    "[CMD] Received: START_GRAB\r\n",    "[CMD] Rejected: START_GRAB (invalid state %d)\r\n"},
         {"START_RELEASE", STATE_IDLE,     true,  STATE_RELEASE, "[CMD] Received: START_RELEASE\r\n", "[CMD] Rejected: START_RELEASE (invalid state %d)\r\n"},
-        {"RESET",         STATE_IDLE,     true,  STATE_IDLE,    "[CMD] Received: RESET\r\n",         "[CMD] Rejected: RESET (invalid state %d)\r\n"},
+        {"RESET",         STATE_IDLE,     true,  STATE_RESET,   "[CMD] Received: RESET\r\n",         "[CMD] Rejected: RESET (invalid state %d)\r\n"},
     };
 
     for (uint i = 0; i < sizeof(rules) / sizeof(rules[0]); i++) {
@@ -134,17 +137,6 @@ static bool uart_try_dispatch_command(void) {
             if (current_state == rules[i].required_state ||
                 rules[i].allow_any_state) {
                 DBG_PRINT("%s", rules[i].received_msg);
-                /* 特殊命令：RESET 立即执行安全复位并回送确认 */
-                if (strcmp(rules[i].keyword, "RESET") == 0) {
-                    servo1_set(SERVO_RESET_ANGLE);
-                    servo2_set(SERVO_RESET_ANGLE);
-                    gpio_put(FLY_TRIGGER_PIN, 0);
-                    fly_pulse_active = false;
-                    actuate_start = nil_time;
-                    error_recovery_count = 0;
-                    reset_done = true;
-                    send_feedback_repeat("RESET_DONE\r\n", 3, 50);
-                }
                 current_state = rules[i].next_state;
             } else {
                 DBG_PRINT(rules[i].rejected_msg, current_state);
@@ -239,6 +231,12 @@ void led_fx_update(void) {
         case STATE_GRAB:
         case STATE_RELEASE: {
             // 彗星推进：逐步拉满再熄灭
+            const uint8_t seq[] = {0x1, 0x3, 0x7, 0xF, 0xE, 0xC, 0x8, 0x0};
+            mask = seq[led_fx.tick % (sizeof(seq) / sizeof(seq[0]))];
+            break;
+        }
+        case STATE_RESET: {
+            // 复位过程沿用同样的推进灯效，表示正在执行安全回位。
             const uint8_t seq[] = {0x1, 0x3, 0x7, 0xF, 0xE, 0xC, 0x8, 0x0};
             mask = seq[led_fx.tick % (sizeof(seq) / sizeof(seq[0]))];
             break;
@@ -466,12 +464,16 @@ void state_machine_run(void) {
             release_seq_started = false;
             release_seq_gap_start = nil_time;
         }
+        if (current_state != STATE_RESET) {
+            reset_seq_started = false;
+            reset_seq_gap_start = nil_time;
+        }
     }
 
     switch (current_state) {
         case STATE_IDLE:
             if (entered) {
-                DBG_PRINT("[STATE] IDLE (Send 'grab')\r\n");
+                DBG_PRINT("[STATE] IDLE (Send 'START_GRAB')\r\n");
             }
             break;
 
@@ -493,13 +495,11 @@ void state_machine_run(void) {
                 break;
             }
 
-            ServoActionResult res2 = servo2_set(SERVO_TARGET_ANGLE);
+            ServoActionResult res2 = servo2_set(SERVO_TARGET_ANGLE+3);
             if (res2 == SERVO_ACTION_BLOCKED) {
                 DBG_PRINT("[WARN] S2 blocked, will retry\r\n");
                 break;
             }
-            grab_seq_started = false;
-            grab_seq_gap_start = nil_time;
             if (is_nil_time(actuate_start)) {
                 actuate_start = get_absolute_time();
             }
@@ -513,6 +513,8 @@ void state_machine_run(void) {
                 fly_trigger_pulse_start(1000);
                 actuate_start = nil_time;
                 current_state = STATE_HOLDING;
+                grab_seq_started = false;
+                grab_seq_gap_start = nil_time;
             }
             break;
         }
@@ -520,7 +522,7 @@ void state_machine_run(void) {
         case STATE_HOLDING:
             // 持货等待阶段，不主动动作，仅等待 release 命令。
             if (entered) {
-                DBG_PRINT("[STATE] Holding (Send 'release')\r\n");
+                DBG_PRINT("[STATE] Holding (Send 'START_RELEASE')\r\n");
             }
             break;
 
@@ -549,8 +551,6 @@ void state_machine_run(void) {
                 break;
             }
 
-            release_seq_started = false;
-            release_seq_gap_start = nil_time;
             if (is_nil_time(actuate_start)) {
                 actuate_start = get_absolute_time();
             }
@@ -563,6 +563,56 @@ void state_machine_run(void) {
                 fly_trigger_pulse_start(1000);
                 actuate_start = nil_time;
                 current_state = STATE_IDLE;
+                release_seq_started = false;
+                release_seq_gap_start = nil_time;
+            }
+            break;
+        }
+
+        case STATE_RESET: {
+            if (!reset_seq_started) {
+                DBG_PRINT("[ACT] Reset sequence: S1 then S2\r\n");
+                gpio_put(FLY_TRIGGER_PIN, 0);
+                fly_pulse_active = false;
+                actuate_start = nil_time;
+                error_recovery_count = 0;
+                reset_done = false;
+
+                ServoActionResult s1_res = servo1_set(SERVO_RESET_ANGLE);
+                if (s1_res == SERVO_ACTION_BLOCKED) {
+                    DBG_PRINT("[WARN] S1 reset blocked, will retry\r\n");
+                    break;
+                }
+                reset_seq_started = true;
+                reset_seq_gap_start = get_absolute_time();
+                break;
+            }
+
+            if (absolute_time_diff_us(reset_seq_gap_start, get_absolute_time())
+                < (int64_t)SERVO_GRAB_GAP_MS * 1000) {
+                break;
+            }
+
+            ServoActionResult s2_res = servo2_set(SERVO_RESET_ANGLE);
+            if (s2_res == SERVO_ACTION_BLOCKED) {
+                DBG_PRINT("[WARN] S2 reset blocked, will retry\r\n");
+                break;
+            }
+
+        
+            if (is_nil_time(actuate_start)) {
+                actuate_start = get_absolute_time();
+            }
+
+            if (absolute_time_diff_us(actuate_start, get_absolute_time())
+                > SERVO_DELAY_MS * 1000) {
+                DBG_PRINT("[FEEDBACK] reset_finished\r\n");
+                send_feedback_repeat("RESET_DONE\r\n", 3, 50);
+                reset_done = true;
+                actuate_start = nil_time;
+                current_state = STATE_IDLE;
+                reset_seq_started = false;
+                reset_seq_gap_start = nil_time;
             }
             break;
         }

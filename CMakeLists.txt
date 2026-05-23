@@ -57,7 +57,7 @@ else()
             PICO_DEFAULT_UART=0
             PICO_DEFAULT_UART_TX_PIN=12
             PICO_DEFAULT_UART_RX_PIN=13
-            PICO_DEFAULT_UART_BAUD_RATE=115200)
+            PICO_DEFAULT_UART_BAUD_RATE=57600)
 endif()
 
 # Define TEST_MODE macro from numeric cache value directly.
